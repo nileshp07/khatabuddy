@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "khatabuddy",
+    "name": "KhataBuddy",
     "slug": "khatabuddy",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -34,8 +34,12 @@
             "imageWidth": 76
           }
         }
-      ]
+      ],
+      "expo-secure-store"
     ],
+    "splash": {
+      "backgroundColor": "#FAF5EC"
+    },
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true

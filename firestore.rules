@@ -1,0 +1,125 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function groupData(groupId) {
+      return get(/databases/$(database)/documents/groups/$(groupId)).data;
+    }
+
+    // Membership is checked against the denormalized memberIds array on the group
+    // doc — one get() per evaluation, cached within the request.
+    function isMember(groupId) {
+      return isSignedIn() && request.auth.uid in groupData(groupId).memberIds;
+    }
+
+    // ---- Users ----
+    match /users/{uid} {
+      // Profiles are readable by any signed-in user (display names, avatars);
+      // a user may only write their own profile document.
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn() && request.auth.uid == uid;
+      allow delete: if false;
+    }
+
+    // ---- Invites (top-level, keyed by code) ----
+    match /invites/{code} {
+      // Anyone signed in who knows the code can read it (that's the point of an
+      // invite). Only the creator can mint one; invites are immutable.
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.createdBy == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // ---- Groups ----
+    match /groups/{groupId} {
+      // `get` of a non-existent doc has resource == null — allow it so existence
+      // checks (e.g. opening/creating a buddy pair) don't hit a null deref and
+      // throw "permission denied". `list` only returns docs you're a member of.
+      allow get: if isSignedIn()
+        && (resource == null || request.auth.uid in resource.data.memberIds);
+      allow list: if isSignedIn() && request.auth.uid in resource.data.memberIds;
+
+      // Create: either a normal group (creator is the sole initial member), or a
+      // 1:1 "direct" buddy pair (creator + one buddy, exactly 2 members). The buddy
+      // pair stores both names in `participants` so no cross-user member write is
+      // needed.
+      allow create: if isSignedIn()
+        && request.resource.data.createdBy == request.auth.uid
+        && (
+          request.resource.data.memberIds == [request.auth.uid]
+          || (
+            request.resource.data.kind == 'direct'
+            && request.auth.uid in request.resource.data.memberIds
+            && request.resource.data.memberIds.size() == 2
+          )
+        );
+
+      // Update: existing members may edit group metadata, OR a non-member may
+      // self-join (append ONLY their own uid) when a valid invite exists for the
+      // group. The diff() check is the marquee rule — it proves the only change
+      // to memberIds is the caller adding themselves.
+      allow update: if isMember(groupId) || isSelfJoin();
+
+      allow delete: if false;
+
+      function isSelfJoin() {
+        return isSignedIn()
+          && !(request.auth.uid in resource.data.memberIds)
+          && request.resource.data.memberIds == resource.data.memberIds.concat([request.auth.uid])
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberIds', 'updatedAt'])
+          && exists(/databases/$(database)/documents/invites/$(resource.data.inviteCode));
+      }
+
+      // ---- Members subcollection ----
+      match /members/{memberId} {
+        allow read: if isMember(groupId);
+        // A user can only create/update their OWN member document (self-join &
+        // profile snapshot). This is what makes the batched join safe even
+        // before the group's memberIds update is visible to rules.
+        allow create, update: if isSignedIn() && request.auth.uid == memberId;
+        allow delete: if false;
+      }
+
+      // ---- Expenses subcollection ----
+      match /expenses/{expenseId} {
+        allow read: if isMember(groupId);
+
+        // Integrity we CAN express in rules: positive amount, author identity,
+        // and that splits/paidBy are present lists. The full sum(splits)==amount
+        // invariant can't be expressed (rules have no array reduce), so it's
+        // enforced client-side in expenses/service.ts#assertBalanced.
+        allow create: if isMember(groupId)
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.amount is int
+          && request.resource.data.amount > 0
+          && request.resource.data.splits is list
+          && request.resource.data.paidBy is list;
+
+        // Updates are limited to soft-delete / edits by members.
+        allow update: if isMember(groupId);
+        allow delete: if false;
+      }
+
+      // ---- Settlements subcollection ----
+      match /settlements/{settlementId} {
+        allow read: if isMember(groupId);
+        allow create: if isMember(groupId)
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.amount is int
+          && request.resource.data.amount > 0
+          && request.resource.data.fromUserId != request.resource.data.toUserId;
+        allow update, delete: if false;
+      }
+
+      // ---- Recurring bills (home groups, Phase 5) ----
+      match /recurringBills/{billId} {
+        allow read, write: if isMember(groupId);
+      }
+    }
+  }
+}

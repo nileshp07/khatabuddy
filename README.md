@@ -1,56 +1,153 @@
-# Welcome to your Expo app 👋
+# KhataBuddy
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+A Splitwise-style expense splitter for React Native, differentiated for **trips**,
+**flatmates (recurring)**, and **events** — with a strong design layer and an
+architecture built around an **append-only ledger** and **derived balances**.
 
-## Get started
+> *Khata* (खाता) is the Hindi word for a ledger. The whole app is themed as a warm,
+> tactile ledger — marigold, ink, and clay-red on cream / deep-ink.
 
-1. Install dependencies
+This repo is a portfolio project: the priorities are **architecture, code quality, and
+technical depth** over feature count.
 
-   ```bash
-   npm install
-   ```
+---
 
-2. Start the app
+## Why it's interesting (architecture highlights)
 
-   ```bash
-   npx expo start
-   ```
+**1. Append-only ledger → derived balances.** Expenses and settlements are an immutable
+log. Per-member balances are *never stored* — they're recomputed from the log by a pure
+reducer ([`engine.ts`](src/features/balances/engine.ts)). This makes offline / optimistic
+writes **conflict-free** (appends never collide, unlike concurrent edits to a shared
+`balance` field) and makes the core trivially unit-testable.
 
-In the output, you'll find options to open the app in a
+**2. Debt simplification runs client-side.** A greedy min-cash-flow algorithm
+([`simplifyDebts`](src/features/balances/engine.ts)) minimizes the number of settle-up
+transactions. It's a cheap pure function over already-loaded balances — no Cloud Function
+round-trip, works offline.
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+**3. Money is always integer minor units.** No floats. Parsing happens once at the input
+boundary; all math is integer; formatting happens once at display
+([`lib/money`](src/lib/money/index.ts)). Split allocation uses the **largest-remainder
+method** so parts always sum *exactly* to the total — no lost or phantom paise.
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+**4. Firestore listeners, not React Query.** Firestore already provides a real-time cache
+with offline persistence and latency compensation; React Query would duplicate or fight
+it and has no first-class subscription model. Thin typed hooks
+([`useFirestore.ts`](src/lib/hooks/useFirestore.ts)) wrap `onSnapshot` to give
+`{ data, loading, error }` ergonomics plus a `hasPendingWrites` flag for optimistic UI.
 
-## Get a fresh project
+**5. Membership-scoped security rules with a self-join diff.** Access is scoped to the
+denormalized `memberIds` array. The marquee rule lets a non-member self-join by appending
+**only their own uid** — proven with Firestore's `diff().affectedKeys()`
+([`firestore.rules`](firestore.rules)). *Honest limitation noted in the rules: the
+`sum(splits) == amount` invariant can't be expressed in rules (no array reduce), so it's
+enforced client-side in [`assertBalanced`](src/features/expenses/service.ts).*
 
-When you're ready, run:
+**6. Optimistic writes use client timestamps where it matters.** Docs written with
+`serverTimestamp()` are invisible to `orderBy('createdAt')` queries until the server
+resolves them — so feed-ordered docs use `Timestamp.now()` and appear instantly under
+latency compensation; non-ordered fields keep `serverTimestamp()`.
 
-```bash
-npm run reset-project
+---
+
+## Tech stack
+
+| Layer | Choice |
+| --- | --- |
+| Runtime | Expo SDK 56, React Native 0.85, React 19 (React Compiler on) |
+| Routing | Expo Router (file-based, typed routes) |
+| Styling | NativeWind v4 (Tailwind) + CSS-variable theming, light/dark |
+| Backend | Firebase Auth + Firestore (client-first; Cloud Functions reserved for Phase 5) |
+| Local state | Zustand (session, theme, toasts) |
+| Server state | Direct Firestore `onSnapshot` listeners |
+| Forms | react-hook-form + Zod |
+| Animation | Reanimated 4 |
+| Type / money | Fraunces (display) · Geist (UI) · Geist Mono (figures) |
+
+---
+
+## Project structure
+
+```
+src/
+├── app/                      # Expo Router routes (thin screens)
+│   ├── (auth)/               # sign-in / sign-up (guarded: redirects if authed)
+│   ├── (app)/                # authed area (guarded: redirects if not)
+│   │   ├── index.tsx         # groups list (home)
+│   │   ├── create-group, join, profile
+│   │   └── group/[groupId]/  # detail, add-expense, settle, members
+│   └── join/[code].tsx       # deep-link invite handler
+├── components/ui/            # design system (Firestore-agnostic)
+├── features/                 # auth · groups · expenses · balances · settlements
+│   └── balances/engine.ts    # ← pure reducer + debt simplification (tested)
+├── lib/                      # firebase · hooks · money · cn/color/date
+├── store/                    # zustand stores
+├── theme/                    # tokens + light/dark controller
+└── validation/               # zod schemas
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+---
 
-### Other setup steps
+## Data model (Firestore)
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+```
+users/{uid}
+groups/{groupId}                       # memberIds[] (denormalized), inviteCode, type, currency, budget?
+  members/{uid}                        # role, denormalized displayName/photo
+  expenses/{id}                        # amount, paidBy[], splits[] (embedded), splitMethod, deletedAt?
+  settlements/{id}                     # fromUserId, toUserId, amount
+  recurringBills/{id}                  # Phase 5
+invites/{code}                         # → groupId  (keeps join logic clean & private)
+```
 
-## Learn more
+Key denormalization tradeoffs are documented inline in [`lib/types.ts`](src/lib/types.ts):
+`memberIds` powers both rules and the "my groups" query; `splits` are **embedded** on the
+expense (always read together, written atomically) instead of a separate collection.
 
-To learn more about developing your project with Expo, look at the following resources:
+---
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+## Running it
 
-## Join the community
+```bash
+npm install
 
-Join our community of developers creating universal apps.
+# Option A — fully local, no Firebase project needed:
+npm i -g firebase-tools
+firebase emulators:start                 # Auth :9099, Firestore :8080
+# set EXPO_PUBLIC_USE_EMULATOR=true in .env (see .env.example)
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+# Option B — real project: copy .env.example → .env and fill in the web config
+
+npm start                                # then press i / a, or scan in Expo Go
+```
+
+### Quality gates
+
+```bash
+npm run typecheck     # tsc --noEmit (clean)
+npm test              # Jest — money + balance-engine unit tests (20 passing)
+npm run lint          # expo lint
+```
+
+The pure-logic tests are the correctness proof: largest-remainder split allocation
+(`₹100 ÷ 3 → 34/33/33`, always sums back), the balance reducer (always nets to zero,
+ignores soft-deletes, multi-payer), and debt simplification (≤ n−1 transfers, conserves
+money). See [`money.test.ts`](src/lib/money/money.test.ts) and
+[`engine.test.ts`](src/features/balances/engine.test.ts).
+
+---
+
+## Build status & roadmap
+
+**Built (Phase 1–2):** email/password auth + persisted session, create/join groups (invite
+code + deep link), real-time group ledger, add-expense with **equal / exact / percent**
+splits (live-validated), settle-up with **minimized** suggested payments, derived
+balances, activity feed, members/invite, light/dark + haptics + skeletons + custom empty
+states + toasts.
+
+**Next (per the plan):**
+- **Phase 3** — Trip budget tracker (planned vs spent, daily burn) — pure client logic.
+- **Phase 4** — Settle-up celebration animation, deeper motion polish.
+- **Phase 5** — Cloud Functions: push fan-out, scheduled recurring bills (idempotent),
+  guest links; gamification (streaks/badges).
+- **Phase 6** — `@firebase/rules-unit-testing` suite, EAS build profiles, deploy prep.

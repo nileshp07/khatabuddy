@@ -38,6 +38,11 @@ yarn-error.*
 
 example
 
+.env
+
 # generated native folders
 /ios
 /android
+
+# Firebase admin key (never commit)
+serviceAccountKey.json
